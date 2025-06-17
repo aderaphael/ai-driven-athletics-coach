@@ -116,7 +116,7 @@ def generate_12_week_plan(features):
 # Use Seq2Seq base or your fine-tuned checkpoint
 seq2seq = pipeline("text2text-generation",
                    model="google/flan-t5-base",
-                   tokenizer="google/flan-t5-base")
+                   tokenizer="google/flan-t5-base", device=-1)
 
 def parse_json_output(text):
     t = text.strip()
