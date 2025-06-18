@@ -3,7 +3,7 @@ import pandas as pd
 import copy
 from datetime import datetime
 from geopy.distance import geodesic
-from transformers import pipeline
+from transformers import pipeline as hf_pipeline
 import json
 import streamlit as st
 
@@ -23,7 +23,8 @@ def parse_gpx_file(file):
         lon = float(wpt.attrib['lon'])
         ele = float(wpt.find('default:ele', ns).text)
         time = datetime.fromisoformat(
-            wpt.find('default:time', ns).text.replace('Z', '+00:00'))
+            wpt.find('default:time', ns).text.replace('Z', '+00:00')
+        )
         hr_elem = wpt.find('.//gpxtpx:hr', ns)
         hr = int(hr_elem.text) if hr_elem is not None else None
         data.append([time, lat, lon, ele, hr])
@@ -61,9 +62,10 @@ def classify_fitness_level(distance):
         return 'intermediate'
     return 'advanced'
 
-def generate_week_plan(features):
+# **Updated**: accept `runs_per_week` explicitly
+def generate_week_plan(features, runs_per_week):
     level = classify_fitness_level(features['total_weekly_distance_km'])
-    runs = features['run_frequency_days']
+    runs = runs_per_week
     if level == 'beginner':
         return ['Easy Run']*(runs-1) + ['Long Run']
     if level == 'intermediate':
@@ -73,7 +75,7 @@ def generate_week_plan(features):
 # -------------------------------
 # Phase 4: VDOT Table Integration
 # -------------------------------
-vdot_df = pd.read_csv('vdot_table_sample.csv')  # ensure this CSV is next to app.py
+vdot_df = pd.read_csv('vdot_table_sample.csv')
 
 def get_vdot_row(user_vdot):
     return vdot_df.iloc[(vdot_df['VDOT'] - user_vdot).abs().argsort()[:1]].squeeze()
@@ -87,21 +89,21 @@ def get_session_pace(session, vdot_row):
         return vdot_row['Interval_Pace']
     if session == 'Repetition':
         return vdot_row['Repetition_Pace']
-    # slightly slower on long runs
     return vdot_row['Easy_Pace_min_per_km'] + 0.3
 
 # -------------------------------
 # Phase 5: Multi-Week Plan Builder
 # -------------------------------
-def generate_12_week_plan(features):
+# **Updated**: pass `runs_per_week` through
+def generate_12_week_plan(features, runs_per_week):
     base_dist = features['total_weekly_distance_km']
     base_long = features['longest_run_km']
-    prog = [1.0,1.05,1.1,1.15,1.2,1.25,1.3,1.35,0.9,0.8,0.7,0.5]
+    progression = [1.0,1.05,1.1,1.15,1.2,1.25,1.3,1.35,0.9,0.8,0.7,0.5]
     plan = []
     for i in range(12):
-        total_km = round(base_dist * prog[i],1)
+        total_km = round(base_dist * progression[i],1)
         long_km  = round(base_long + min(i//2,4),1)
-        sessions = generate_week_plan(features)
+        sessions = generate_week_plan(features, runs_per_week)
         plan.append({
             'week': i+1,
             'total_target_km': total_km,
@@ -113,26 +115,28 @@ def generate_12_week_plan(features):
 # -------------------------------
 # Phase 6: Feedback & Adaptation
 # -------------------------------
-# Use Seq2Seq base or your fine-tuned checkpoint
-seq2seq = pipeline("text2text-generation",
-                   model="google/flan-t5-base",
-                   tokenizer="google/flan-t5-base", device=-1)
-
-def parse_json_output(text):
-    t = text.strip()
-    if t.lower().startswith("output"):
-        t = t.split(":",1)[1].strip()
-    try:
-        return json.loads(t)
-    except json.JSONDecodeError:
-        return feedback_to_structured_json(t)
+classifier = hf_pipeline(
+    "zero-shot-classification",
+    model="facebook/bart-large-mnli",
+    device=-1
+)
+ZS_LABELS = ["fatigue", "too_easy", "missed_or_injured"]
 
 def feedback_to_structured_json(feedback_text):
-    f = feedback_text.lower()
+    text = feedback_text.lower()
+    if "injur" in text:
+        return {"fatigue": False, "increase_difficulty": False, "adjust_schedule": True}
+    res = classifier(
+        sequences=feedback_text,
+        candidate_labels=ZS_LABELS,
+        multi_label=True
+    )
+    labels, scores = res["labels"], res["scores"]
+    mapping = {label: score for label, score in zip(labels, scores)}
     return {
-        "fatigue": any(w in f for w in ["tired","fatigued","exhausted","sore"]),
-        "increase_difficulty": any(w in f for w in ["easy","bored","too slow"]),
-        "adjust_schedule": any(w in f for w in ["missed","skipped","injured","busy"])
+        "fatigue":           mapping.get("fatigue", 0) > 0.5,
+        "increase_difficulty": mapping.get("too_easy", 0) > 0.5,
+        "adjust_schedule":     mapping.get("missed_or_injured", 0) > 0.5
     }
 
 def adapt_week_plan(week, fb):
@@ -158,7 +162,6 @@ def adapt_week_plan(week, fb):
 # -------------------------------
 # Phase 7: Streamlit UI
 # -------------------------------
-
 st.title("AI‑Driven Athletics Coach Prototype")
 
 # 1) GPX upload
@@ -167,39 +170,39 @@ if not uploaded:
     st.info("Please upload a GPX file to get started.")
     st.stop()
 
-# 2) Parse & feature‑engineer
-df   = parse_gpx_file(uploaded)
+# 2) Parse & features
+df    = parse_gpx_file(uploaded)
 feats = calculate_features(df)
 st.subheader("Extracted Features")
 st.json(feats)
 
-# 3) Build the 12‑week plan
-plan = generate_12_week_plan(feats)
+# **New** Runs‐per‐week slider
+runs_per_week = st.slider(
+    "How many sessions per week?", 1, 7, 3
+)
+
+# 3) Build multi‐week plan with that frequency
+plan     = generate_12_week_plan(feats, runs_per_week)
 vdot_row = get_vdot_row(feats.get('vdot', 45))
-# Enrich each week’s sessions with paces
 for wk in plan:
     wk['sessions'] = [
-        {'type': s, 'pace_min_per_km': round(get_session_pace(s, vdot_row), 2)}
+        {'type': s,
+         'pace': round(get_session_pace(s, vdot_row), 2)}
         for s in wk['sessions']
     ]
 
-# 4) Let the user pick which week to view
-week_numbers = [wk['week'] for wk in plan]
-current_week = st.slider("Select week to view", min_value=1, max_value=12, value=1)
+# 4) Week selector
+current_week = st.slider("Select week to view", 1, 12, 1)
+wk_data = plan[current_week-1]
 
-# Fetch that week’s data
-wk_data = plan[current_week - 1]
-
-st.subheader(f"Week {current_week} – Target: {wk_data['total_target_km']} km, Long Run: {wk_data['long_run_km']} km")
+st.subheader(f"Week {current_week} Plan ({runs_per_week} sessions)")
 st.table(pd.DataFrame(wk_data['sessions']))
 
-# 5) Feedback & adaptation for the selected week
-fb_text = st.text_input(f"Feedback on Week {current_week} (e.g. 'I felt tired'):")
+# 5) Feedback & adaptation
+fb_text = st.text_input(f"Feedback on Week {current_week} (e.g. 'I felt knackered'):")
 if st.button(f"Adapt Week {current_week}"):
-    raw = seq2seq(f"translate feedback to json: {fb_text}", max_new_tokens=50)[0]['generated_text']
-    fb  = parse_json_output(raw)
+    fb      = feedback_to_structured_json(fb_text)
     st.write("Structured feedback:", fb)
-
     adapted = adapt_week_plan(wk_data, fb)
     st.subheader(f"Adapted Week {current_week}")
     st.table(pd.DataFrame(adapted['sessions']))
